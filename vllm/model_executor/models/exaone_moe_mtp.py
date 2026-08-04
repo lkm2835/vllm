@@ -28,6 +28,42 @@ logger = init_logger(__name__)
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
+def _checkpoint_ignores_mtp(hf_config) -> bool:
+    """Whether the checkpoint's own quantization_config excludes the MTP head.
+    Read from the raw HF config rather than the resolved QuantizationConfig:
+    ``Fp8Config.ignored_layers`` is mutable shared state that
+    ``apply_vllm_mapper()`` rewrites in place for whichever model is built
+    first, and a mapper that maps ``mtp.*`` to None (e.g. the Transformers
+    backend) drops the "mtp" entry entirely.
+    """
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is None:
+        return False
+    if not isinstance(quantization_config, dict):
+        quantization_config = getattr(quantization_config, "__dict__", {})
+
+    # Mirrors Fp8Config.from_config's key precedence.
+    ignored = quantization_config.get("ignored_layers") or quantization_config.get(
+        "modules_to_not_convert"
+    )
+    return any(str(entry).rstrip(".") == "mtp" for entry in ignored or ())
+
+
+def _draft_quant_config(vllm_config: VllmConfig):
+    """K-EXAONE FP8 checkpoints keep the MTP head in bf16 and mark it via
+    quantization_config.ignored_layers=["mtp", ...], assuming substring
+    matching. Fp8Config full-prefix-matches ignored_layers, so draft linears
+    would be built fp8-serialized and silently load bf16 weights with
+    uninitialized scales (0% acceptance). Build the draft unquantized when
+    the checkpoint ignores "mtp"."""
+    quant_config = vllm_config.quant_config
+    if quant_config is not None and _checkpoint_ignores_mtp(
+        vllm_config.model_config.hf_config
+    ):
+        return None
+    return quant_config
+
+
 @support_torch_compile
 class ExaoneMoeMultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(
@@ -45,7 +81,7 @@ class ExaoneMoeMultiTokenPredictor(nn.Module):
         super().__init__()
 
         model_config = vllm_config.model_config
-        quant_config = vllm_config.quant_config
+        quant_config = _draft_quant_config(vllm_config)
         lora_config = vllm_config.lora_config
         config = model_config.hf_config
 
